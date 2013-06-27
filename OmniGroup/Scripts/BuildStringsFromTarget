@@ -1,0 +1,114 @@
+#!/bin/zsh -euf
+#
+# Copyright 2010-2011 Omni Development, Inc. All rights reserved.
+#
+# This software may only be used and reproduced according to the
+# terms in the file OmniSourceLicense.html, which should be
+# distributed with this project and can also be found at
+# <http://www.omnigroup.com/developer/sourcecode/sourcelicense/>.
+#
+# $Id$
+
+
+#
+# Xcode doesn't go out of its way to make it easy to figure out which source
+# files were a part of which target.
+#
+
+SCRIPTS_DIR=$0:h
+
+# Require the caller to provide a list of expected string table names. This prevents cases where NSLocalizedStringXXX calls are moved from one framework to another without fixing the table name (and thus possibly resulting in collisions)
+if [ $# = 0 ]; then
+    echo "No expected strings file names given!"
+    echo "usage: $0 table-name1 ..."
+    exit 1
+fi
+
+# Build the strings file(s) into a separate directory so we can avoid mucking with timestamps in the build output unless needed (see below).
+STRINGS_DIR="$DERIVED_FILES_DIR/BuildStringsFromTarget-$TARGET_NAME"
+TMP_OUTPUT="$STRINGS_DIR"/English.lproj
+FILE_LIST="$TMP_OUTPUT"/files
+
+if [ -d "$STRINGS_DIR" ]; then
+  # If we've run before and nothing has changed, bail
+  if [ -f "$FILE_LIST" ]; then
+      NEWER="no"
+      cat "$FILE_LIST" | while read file; do
+          if [ "$file" -nt "$FILE_LIST" ]; then
+              NEWER="yes"
+          fi
+      done
+      if [ "$NEWER" = "no" ]; then
+          exit 0
+      fi
+  fi
+  
+  # Otherwise start from scratch and continue on
+  rm -rf "$STRINGS_DIR"
+fi
+
+mkdir -p "$STRINGS_DIR"
+mkdir "$TMP_OUTPUT"
+
+# Gather the source files and the project file that defined them into a list, which we'll use for early-out
+echo "$PROJECT_FILE_PATH"/project.pbxproj  > "$FILE_LIST"
+source_files=()
+$SCRIPTS_DIR/ListSourceFilesInTarget "$TARGET_NAME" c,m "$PROJECT_FILE_PATH" | while read f; do
+   source_files+=($f)
+   echo "$f" >> "$FILE_LIST"
+done
+
+if [ $#source_files -gt 0 ]; then
+	/usr/bin/genstrings -u -q -o "$TMP_OUTPUT" $source_files
+fi
+
+FIX_STRINGS_FILE="$BUILD_DIR/$CONFIGURATION"/FixStringsFile
+
+# If we are building a real bundle (Mac framework or app) sync the built files into that bundle.
+if [ -n "${LOCALIZED_RESOURCES_FOLDER_PATH-}" ]; then
+    RESOURCE_DIR="$CONFIGURATION_BUILD_DIR/$LOCALIZED_RESOURCES_FOLDER_PATH"
+else
+    # We're building a static library (for an iOS "framework", most likely)
+    # Publish the results for the app to pick up.
+    RESOURCE_DIR="$CONFIGURATION_BUILD_DIR/Resources/$PRODUCT_NAME/English.lproj"
+fi
+mkdir -p "$RESOURCE_DIR"
+
+# Copy each expected string table
+while [ $# != 0 ]; do
+    table_name=$1; shift;
+    
+    table_file="$TMP_OUTPUT/${table_name}.strings"
+    if [ ! -f "$table_file" ]; then
+        echo "Expected a '${table_name}' string table to be generated!"
+        exit 1
+    fi
+    
+    # Sort and translate common ASCII sequences into Unicode.
+    if [ -x "$FIX_STRINGS_FILE" ]; then
+    	"$FIX_STRINGS_FILE" "$table_file"
+    else
+        # Probably a local build from Xcode rather than our build scripts.
+        echo "FixStringsFile isn't built -- skipping (this will result in ASCII to Unicode conversions not happening)"
+    fi
+    
+	if [ "${STRINGS_FILE_OUTPUT_ENCODING-}" = "binary" ]; then
+		# In the case that we are building on iOS and these strings are in the main app wrapper, they won't go through CopyLibraryResource (which does the binary-ification for those resources).
+		/usr/bin/plutil -convert binary1 "$table_file"
+	fi
+	
+    # Make sure not to re-copy if only the source timestamp has changed. That will invalidate timestamps that may cause further copying into the app bundle. This in turn can invalidate signing, which is very annoying if we are doing incremental device builds.
+    rsync -v --recursive --checksum "$table_file" "$RESOURCE_DIR/${table_file:t}"
+    
+    # Remove the processed files (so that we can check for unexpected files)
+    rm "$table_file"
+done
+
+unexpected=0
+for x in "$TMP_OUTPUT"/*(N); do
+    if [ "$x" != "$FILE_LIST" ]; then
+        echo "Unexpected string file emitted: $x"
+        unexpected=1
+    fi
+done
+exit $unexpected
